@@ -1,0 +1,96 @@
+#!/bin/bash
+#
+# This script will reboot the currently active head by reading
+# the hostname from /opr/argus_active.log
+# and using ssh root@argusN-lom via expect to generate an NMI.
+# XXX it doesn't check that the last-known active hostname is
+# recent or correct.
+#
+# 1.03 psc Sun Dec 13 15:47:33 GMT 2015 - Moved the minimum-time checks
+#	from the argus_watchdog scripts to here so both the automated and
+#	web-based attemps have the same time-out restriction to prevent
+#	multiple attempts too soon.
+# 1.02 psc Wed Dec 09 15:20:35 GMT 2015 - Added logger calls and some
+#	extra tests on the log file being present.
+# 1.01 psc Wed Dec 09 12:12:14 GMT 2015 - Remove temp file after use.
+# 1.00 arb Fri Dec 04 15:15:00 GMT 2015 - First version.
+
+ARGUS_GENERIC_URL="https://argus:215/"
+ARGUS1_URL="https://argus1:215/"
+ARGUS2_URL="https://argus2:215/"
+ARGUS1_LOM_URL="https://argus1-lom/"
+ARGUS2_LOM_URL="https://argus2-lom/"
+ARGUS_LOM_PASSWORD="am28dec"
+tmp=/tmp/argus_monitor.$$
+activeheadlog=/opr/argus_active.log
+
+# The time-check file and time-out (in seconds)
+readonly timefile="/tmp/argus_NMI_date.lock"
+readonly mintime=1800
+
+time_since_NMI_OK()
+{
+	# Safe guess in case file mysteriously not there...
+	local difftm=0
+	local lasttime=
+	# Get current time in time_t format
+	local tnow=$(date +%s)
+
+	if [ -f $timefile ] ; then
+		# File exists, check it.
+		lasttime=$(stat $timefile -c %Y)
+		difftm=$(($tnow - $lasttime))
+		logger -s "[$$] Time since last NMI is $difftm seconds"
+		if [ $difftm -lt $mintime ] ; then
+			return 0
+		fi
+	fi
+	# Return 1 if OK (no previous file, or time since file grater then
+	# the time-out value).
+	return 1
+}
+
+if [ "$1" != "-f" ]; then
+	echo $0 `date` "This will reboot argus if you can guess the right command line parameter" >&2
+	exit 1
+fi
+
+logger -s "[$$] Running the Argus NMI reboot script"
+
+# Check for recent NMI so we don't end up in an endless loop.
+time_since_NMI_OK
+if [ $? -eq 0 ] ; then
+	logger -s "[$$] Too soon to attempt another NMI (timeout = $mintime)"
+# Then determine which head is active by reading the log
+elif [ -f $activeheadlog ] ; then
+	activehead=`tail -1 $activeheadlog | awk '{print$1}'`
+	activeheadlom="${activehead}-lom"
+
+	# Record this attempt in time-stamp file
+	echo `date` > $timefile
+
+	logger -s "[$$] Attempting SSH to $activeheadlom"
+
+	# Now contact the LOM by ssh and generate a NMI
+	# by setting generate_host_nmi=true inside /SP/diag
+	# Can't pipe commands into ssh so use 'expect' to do this.
+	# Wait for the -> prompt then type "set /SP/diag generate_host_nmi=true"
+cat << _EOF > $tmp
+set timeout 60
+spawn ssh root@$activeheadlom
+expect "Password: "
+send "$ARGUS_LOM_PASSWORD\r"
+expect -gl "-> "
+send "exit\r"
+_EOF
+
+	expect -f $tmp
+	echo ""
+	logger -s "[$$] Completed SSH to $activeheadlom"
+else
+	logger -s "[$$] Failed to open $activeheadlog"
+fi
+
+# Clean up for exit
+[ -f "$tmp" ] && rm "$tmp"
+exit 0
